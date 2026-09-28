@@ -36,10 +36,22 @@ class MaskPredictor(nn.Module):
         self.tok = nn.Embedding(V,d)
         self.pos = nn.Embedding(SEQ_LEN,d)
         layer = nn.TransformerEncoderLayer(d_model=d, nhead=n_heads,dim_feedforward=4*d, batch_first=True, dropout = 0.0, norm_first=True, activation='gelu' )
-        self.enc = nn.TransformerEncoder(layer,n_layers, enable_nested_tensor=False)
+        self.enc = nn.TransformerEncoder(layer,n_layers, enable_nested_tensor=False)  # using an encoder(the one change from autoregressive models)
         self.norm = nn.LayerNorm(d)
         self.head = nn.Linear(d,V)
 
     def forward(self, x):  # x: (B,L) token_ids
         h = self.tok(x) + self.pos(torch.arange(x.size(1),device=x.device))
         return self.head(self.norm(self.enc(h)))  # (B,L,V) logits
+
+# defining the loss
+def llada_loss(model,x,prompt_len = PROMPT_LEN,eps =1e-3, sft = True):
+    B,L = x.shape
+    t = (1 - eps) * torch.rand(B, 1, device=x.device) + eps # each of the batch gets a single t between 0-1 
+    maskable = torch.ones_like(x,dtype=torch.bool)
+    if sft:
+        maskable[:,:prompt_len] = False # cannot mask the prompt 
+        masked = (torch.rand(B,L,device=x.device) < t) & maskable
+        xt = torch.where(masked, torch.full_like(x, MASK_ID), x) 
+        ce = F.cross_entropy(model(xt).transpose(1, 2), x, reduction="none") # (B,L)
+        return ((ce * masked) / t).sum(1).div(maskable.sum(1)).mean()
