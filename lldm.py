@@ -40,5 +40,6 @@ class MaskPredictor(nn.Module):
         self.norm = nn.LayerNorm(d)
         self.head = nn.Linear(d,V)
 
-    def forward(self, x):
-        
+    def forward(self, x):  # x: (B,L) token_ids
+        h = self.tok(x) + self.pos(torch.arange(x.size(1),device=x.device))
+        return self.head(self.norm(self.enc(h)))  # (B,L,V) logits
