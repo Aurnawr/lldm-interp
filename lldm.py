@@ -51,7 +51,20 @@ def llada_loss(model,x,prompt_len = PROMPT_LEN,eps =1e-3, sft = True):
     maskable = torch.ones_like(x,dtype=torch.bool)
     if sft:
         maskable[:,:prompt_len] = False # cannot mask the prompt 
-        masked = (torch.rand(B,L,device=x.device) < t) & maskable
-        xt = torch.where(masked, torch.full_like(x, MASK_ID), x) 
-        ce = F.cross_entropy(model(xt).transpose(1, 2), x, reduction="none") # (B,L)
-        return ((ce * masked) / t).sum(1).div(maskable.sum(1)).mean()
+    masked = (torch.rand(B,L,device=x.device) < t) & maskable
+    xt = torch.where(masked, torch.full_like(x, MASK_ID), x) # noised input - overwriting chosen inputs with mask
+    ce = F.cross_entropy(model(xt).transpose(1, 2), x, reduction="none") # (B,L)
+    return ((ce * masked) / t).sum(1).div(maskable.sum(1)).mean() # sums over (L) so every seq has 1 number, average over batch
+
+# defining the training loop 
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = MaskPredictor().to(device=device)
+opt = torch.optim.AdamW(model.parameters(), lr = 3e-4, weight_decay = 0.01)
+for i in range(3000):
+    loss = llada_loss(model, get_batch(256, device=device))
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+    if i % 250 == 0 
+        print(i,loss.item())
