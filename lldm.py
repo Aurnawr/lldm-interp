@@ -1,6 +1,23 @@
-import random, torch, torch.nn as nn, torch.nn.functional as F
+import argparse, csv, json, os, random, torch, torch.nn as nn, torch.nn.functional as F
 
-K = 4
+p = argparse.ArgumentParser()
+p.add_argument("--K", type=int, default=10)
+p.add_argument("--answer", choices=["last", "mod7"], default="last")  # "last" = shortcut (ANS copies r_{K-1})
+p.add_argument("--iters", type=int, default=20000)
+p.add_argument("--batch", type=int, default=256)
+p.add_argument("--n_eval", type=int, default=1000)
+p.add_argument("--seed", type=int, default=0)
+p.add_argument("--ckpt", default=None, help="load this checkpoint and skip training")
+p.add_argument("--out", default="results", help="each run writes to <out>/<run name>/")
+args = p.parse_args()
+
+ckpt = torch.load(args.ckpt, map_location="cpu") if args.ckpt else None
+if ckpt:                                  # task shape must match the trained model
+    args.K, args.answer = ckpt["config"]["K"], ckpt["config"]["answer"]
+
+random.seed(args.seed); torch.manual_seed(args.seed)
+
+K = args.K
 CHARS = list("0123456789+=>")
 STOI = {c: i for i, c in enumerate(CHARS)}
 MASK_ID = len(CHARS)                 # the absorbing state
@@ -9,13 +26,19 @@ PROMPT_LEN, RESP_LEN = 2 * K, K + 1
 SEQ_LEN = PROMPT_LEN + RESP_LEN
 RESP_LABELS = [f"r{i}" for i in range(1, K)] + [">", "ANS"]
 
-def make_example():
+ANSWER_RULES = {
+    "last": lambda ops, partial: partial[-1],          # copyable from the reasoning
+    "mod7": lambda ops, partial: sum(ops) % 7,         # not copyable from any r
+}
+
+def make_example(answer=args.answer):
     ops = [random.randint(0, 9) for _ in range(K)]
     s, partial = ops[0], []
     for o in ops[1:]:
         s = (s + o) % 10
-        partial.append(str(s))
-    text = "+".join(map(str, ops)) + "=" + "".join(partial) + ">" + str(s)
+        partial.append(s)
+    ans = ANSWER_RULES[answer](ops, partial)
+    text = "+".join(map(str, ops)) + "=" + "".join(map(str, partial)) + ">" + str(ans)
     return [STOI[c] for c in text]
 
 def get_batch(B, device):
@@ -48,14 +71,35 @@ def llada_loss(model, x, prompt_len=PROMPT_LEN, eps=1e-3, sft=True):
     ce = F.cross_entropy(model(xt).transpose(1, 2), x, reduction="none")  # (B, L)
     return ((ce * masked) / t).sum(1).div(maskable.sum(1)).mean()
 
+
+run_name = f"K{K}-{args.answer}-s{args.seed}" + ("-eval" if ckpt else "")
+run_dir = os.path.join(args.out, run_name)
+os.makedirs(run_dir, exist_ok=True)
+with open(os.path.join(run_dir, "config.json"), "w") as f:
+    json.dump(vars(args), f, indent=2)
+
+# training loop
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = MaskPredictor().to(device)
-opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-for it in range(3000):
-    loss = llada_loss(model, get_batch(256, device))
-    opt.zero_grad(); loss.backward(); opt.step()
-    if it % 500 == 0:
-        print(it, loss.item())
+if ckpt:
+    model.load_state_dict(ckpt["model"])
+else:
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+    loss_log = []
+    for it in range(args.iters):
+        loss = llada_loss(model, get_batch(args.batch, device))
+        opt.zero_grad(); loss.backward(); opt.step()
+        if it % 50 == 0:
+            loss_log.append((it, loss.item()))
+        if it % 500 == 0:
+            print(it, loss.item())
+    with open(os.path.join(run_dir, "train_loss.csv"), "w", newline="") as f:
+        csv.writer(f).writerows([("iter", "loss")] + loss_log)
+    os.makedirs("checkpoints", exist_ok=True)
+    path = f"checkpoints/{run_name}.pt"
+    torch.save({"model": model.state_dict(), "config": vars(args)}, path)
+    print("saved", path)
 
 @torch.no_grad()
 def generate(model, prompt, gen_len=RESP_LEN, steps=RESP_LEN, block_len=None,
@@ -109,13 +153,41 @@ def stabilization_step(hist, final):
     return torch.where(stable_from.any(1), first, torch.full_like(first, float(S)))
 
 model.eval()
-data = get_batch(1000, device)
+random.seed(args.seed + 1); torch.manual_seed(args.seed + 1)   # same eval whether or not we trained
+data = get_batch(args.n_eval, device)
+target = data[:, PROMPT_LEN:].cpu()
+rows, summary = [("remasking", "position", "acc", "commit", "stable")], {}
 for remasking in ["low_confidence", "random"]:
     out, commit, hist = generate(model, data[:, :PROMPT_LEN], remasking=remasking)
-    resp = out[:, PROMPT_LEN:]
-    stable = stabilization_step(hist, resp.cpu())
-    acc = (resp[:, -1] == data[:, -1]).float().mean().item()
-    print(f"{remasking}: answer acc {acc:.3f}")
+    resp = out[:, PROMPT_LEN:].cpu()
+    stable = stabilization_step(hist, resp)
+    pos_acc = (resp == target).float().mean(0)
+    metrics = {f"{remasking}/answer_acc": pos_acc[-1].item(),
+               f"{remasking}/reasoning_acc": (resp[:, :K - 1] == target[:, :K - 1]).all(1).float().mean().item()}
+    print(f"{remasking}: answer acc {pos_acc[-1]:.3f}")
+
+    # Does the written ANS agree with the written reasoning? Only defined when the
+    # answer is a function of the partial sums, i.e. the "last" rule.
+    if args.answer == "last":
+        follows = resp[:, -1] == resp[:, K - 2]
+        wrong_r = resp[:, K - 2] != target[:, K - 2]
+        metrics[f"{remasking}/ans_follows_reasoning"] = follows.float().mean().item()
+        metrics[f"{remasking}/n_wrong_last_r"] = wrong_r.sum().item()
+        if wrong_r.any():             # when the reasoning is wrong: follow it, or the truth?
+            metrics[f"{remasking}/follows_given_wrong_r"] = follows[wrong_r].float().mean().item()
+            metrics[f"{remasking}/correct_given_wrong_r"] = (resp[wrong_r, -1] == target[wrong_r, -1]).float().mean().item()
+        print(f"  ANS follows written r{K - 1}: {follows.float().mean():.3f}")
+
     for j, name in enumerate(RESP_LABELS):
-        print(f"  {name:>4}  commit {commit[:, j].float().mean():.2f}"
-              f"  stable {stable[:, j].mean():.2f}")
+        c, st = commit[:, j].float().mean().item(), stable[:, j].mean().item()
+        rows.append((remasking, name, pos_acc[j].item(), c, st))
+        metrics.update({f"{remasking}/acc/{name}": pos_acc[j].item(),
+                        f"{remasking}/commit/{name}": c, f"{remasking}/stable/{name}": st})
+        print(f"  {name:>4}  acc {pos_acc[j]:.3f}  commit {c:.2f}  stable {st:.2f}")
+    summary.update(metrics)
+
+with open(os.path.join(run_dir, "per_position.csv"), "w", newline="") as f:
+    csv.writer(f).writerows(rows)
+with open(os.path.join(run_dir, "summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+print("results in", run_dir)
