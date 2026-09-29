@@ -72,35 +72,6 @@ def llada_loss(model, x, prompt_len=PROMPT_LEN, eps=1e-3, sft=True):
     return ((ce * masked) / t).sum(1).div(maskable.sum(1)).mean()
 
 
-run_name = f"K{K}-{args.answer}-s{args.seed}" + ("-eval" if ckpt else "")
-run_dir = os.path.join(args.out, run_name)
-os.makedirs(run_dir, exist_ok=True)
-with open(os.path.join(run_dir, "config.json"), "w") as f:
-    json.dump(vars(args), f, indent=2)
-
-# training loop
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = MaskPredictor().to(device)
-if ckpt:
-    model.load_state_dict(ckpt["model"])
-else:
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-    loss_log = []
-    for it in range(args.iters):
-        loss = llada_loss(model, get_batch(args.batch, device))
-        opt.zero_grad(); loss.backward(); opt.step()
-        if it % 50 == 0:
-            loss_log.append((it, loss.item()))
-        if it % 500 == 0:
-            print(it, loss.item())
-    with open(os.path.join(run_dir, "train_loss.csv"), "w", newline="") as f:
-        csv.writer(f).writerows([("iter", "loss")] + loss_log)
-    os.makedirs("checkpoints", exist_ok=True)
-    path = f"checkpoints/{run_name}.pt"
-    torch.save({"model": model.state_dict(), "config": vars(args)}, path)
-    print("saved", path)
-
 @torch.no_grad()
 def generate(model, prompt, gen_len=RESP_LEN, steps=RESP_LEN, block_len=None,
              temperature=0.0, remasking="low_confidence"):
@@ -152,42 +123,77 @@ def stabilization_step(hist, final):
     first = stable_from.float().argmax(1).float()
     return torch.where(stable_from.any(1), first, torch.full_like(first, float(S)))
 
-model.eval()
-random.seed(args.seed + 1); torch.manual_seed(args.seed + 1)   # same eval whether or not we trained
-data = get_batch(args.n_eval, device)
-target = data[:, PROMPT_LEN:].cpu()
-rows, summary = [("remasking", "position", "acc", "commit", "stable")], {}
-for remasking in ["low_confidence", "random"]:
-    out, commit, hist = generate(model, data[:, :PROMPT_LEN], remasking=remasking)
-    resp = out[:, PROMPT_LEN:].cpu()
-    stable = stabilization_step(hist, resp)
-    pos_acc = (resp == target).float().mean(0)
-    metrics = {f"{remasking}/answer_acc": pos_acc[-1].item(),
-               f"{remasking}/reasoning_acc": (resp[:, :K - 1] == target[:, :K - 1]).all(1).float().mean().item()}
-    print(f"{remasking}: answer acc {pos_acc[-1]:.3f}")
 
-    # Does the written ANS agree with the written reasoning? Only defined when the
-    # answer is a function of the partial sums, i.e. the "last" rule.
-    if args.answer == "last":
-        follows = resp[:, -1] == resp[:, K - 2]
-        wrong_r = resp[:, K - 2] != target[:, K - 2]
-        metrics[f"{remasking}/ans_follows_reasoning"] = follows.float().mean().item()
-        metrics[f"{remasking}/n_wrong_last_r"] = wrong_r.sum().item()
-        if wrong_r.any():             # when the reasoning is wrong: follow it, or the truth?
-            metrics[f"{remasking}/follows_given_wrong_r"] = follows[wrong_r].float().mean().item()
-            metrics[f"{remasking}/correct_given_wrong_r"] = (resp[wrong_r, -1] == target[wrong_r, -1]).float().mean().item()
-        print(f"  ANS follows written r{K - 1}: {follows.float().mean():.3f}")
+def main():
+    run_name = f"K{K}-{args.answer}-s{args.seed}" + ("-eval" if ckpt else "")
+    run_dir = os.path.join(args.out, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
 
-    for j, name in enumerate(RESP_LABELS):
-        c, st = commit[:, j].float().mean().item(), stable[:, j].mean().item()
-        rows.append((remasking, name, pos_acc[j].item(), c, st))
-        metrics.update({f"{remasking}/acc/{name}": pos_acc[j].item(),
-                        f"{remasking}/commit/{name}": c, f"{remasking}/stable/{name}": st})
-        print(f"  {name:>4}  acc {pos_acc[j]:.3f}  commit {c:.2f}  stable {st:.2f}")
-    summary.update(metrics)
+    # training loop
 
-with open(os.path.join(run_dir, "per_position.csv"), "w", newline="") as f:
-    csv.writer(f).writerows(rows)
-with open(os.path.join(run_dir, "summary.json"), "w") as f:
-    json.dump(summary, f, indent=2)
-print("results in", run_dir)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = MaskPredictor().to(device)
+    if ckpt:
+        model.load_state_dict(ckpt["model"])
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+        loss_log = []
+        for it in range(args.iters):
+            loss = llada_loss(model, get_batch(args.batch, device))
+            opt.zero_grad(); loss.backward(); opt.step()
+            if it % 50 == 0:
+                loss_log.append((it, loss.item()))
+            if it % 500 == 0:
+                print(it, loss.item())
+        with open(os.path.join(run_dir, "train_loss.csv"), "w", newline="") as f:
+            csv.writer(f).writerows([("iter", "loss")] + loss_log)
+        os.makedirs("checkpoints", exist_ok=True)
+        path = f"checkpoints/{run_name}.pt"
+        torch.save({"model": model.state_dict(), "config": vars(args)}, path)
+        print("saved", path)
+
+    model.eval()
+    random.seed(args.seed + 1); torch.manual_seed(args.seed + 1)   # same eval whether or not we trained
+    data = get_batch(args.n_eval, device)
+    target = data[:, PROMPT_LEN:].cpu()
+    rows, summary = [("remasking", "position", "acc", "commit", "stable")], {}
+    for remasking in ["low_confidence", "random"]:
+        out, commit, hist = generate(model, data[:, :PROMPT_LEN], remasking=remasking)
+        resp = out[:, PROMPT_LEN:].cpu()
+        stable = stabilization_step(hist, resp)
+        pos_acc = (resp == target).float().mean(0)
+        metrics = {f"{remasking}/answer_acc": pos_acc[-1].item(),
+                   f"{remasking}/reasoning_acc": (resp[:, :K - 1] == target[:, :K - 1]).all(1).float().mean().item()}
+        print(f"{remasking}: answer acc {pos_acc[-1]:.3f}")
+
+        # Does the written ANS agree with the written reasoning? Only defined when the
+        # answer is a function of the partial sums, i.e. the "last" rule.
+        if args.answer == "last":
+            follows = resp[:, -1] == resp[:, K - 2]
+            wrong_r = resp[:, K - 2] != target[:, K - 2]
+            metrics[f"{remasking}/ans_follows_reasoning"] = follows.float().mean().item()
+            metrics[f"{remasking}/n_wrong_last_r"] = wrong_r.sum().item()
+            if wrong_r.any():             # when the reasoning is wrong: follow it, or the truth?
+                metrics[f"{remasking}/follows_given_wrong_r"] = follows[wrong_r].float().mean().item()
+                metrics[f"{remasking}/correct_given_wrong_r"] = (resp[wrong_r, -1] == target[wrong_r, -1]).float().mean().item()
+            print(f"  ANS follows written r{K - 1}: {follows.float().mean():.3f}")
+
+        for j, name in enumerate(RESP_LABELS):
+            c, st = commit[:, j].float().mean().item(), stable[:, j].mean().item()
+            rows.append((remasking, name, pos_acc[j].item(), c, st))
+            metrics.update({f"{remasking}/acc/{name}": pos_acc[j].item(),
+                            f"{remasking}/commit/{name}": c, f"{remasking}/stable/{name}": st})
+            print(f"  {name:>4}  acc {pos_acc[j]:.3f}  commit {c:.2f}  stable {st:.2f}")
+        summary.update(metrics)
+
+    with open(os.path.join(run_dir, "per_position.csv"), "w", newline="") as f:
+        csv.writer(f).writerows(rows)
+    with open(os.path.join(run_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    print("results in", run_dir)
+
+
+if __name__ == "__main__":
+    main()

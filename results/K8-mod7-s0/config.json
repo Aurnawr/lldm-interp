@@ -1,0 +1,10 @@
+{
+  "K": 8,
+  "answer": "mod7",
+  "iters": 20000,
+  "batch": 256,
+  "n_eval": 1000,
+  "seed": 0,
+  "ckpt": null,
+  "out": "results"
+}

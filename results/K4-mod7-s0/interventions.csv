@@ -1,0 +1,12 @@
+condition,ans_acc,ans_changed
+all masked (step 0),1.0,0.0
+true reasoning,1.0,0.0
+random reasoning,0.13950000703334808,0.8605000376701355
+corrupt r1 only,0.9912500381469727,0.008750000037252903
+corrupt r2 only,0.9450000524520874,0.055000003427267075
+corrupt r3 only,0.12000000476837158,0.8800000548362732
+step0 acc r1,1.0,
+step0 acc r2,1.0,
+step0 acc r3,1.0,
+step0 acc >,1.0,
+step0 acc ANS,1.0,
