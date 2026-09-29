@@ -82,3 +82,49 @@ def generate( model, prompt, gen_len= RESP_LEN, steps = RESP_LEN, block_len= Non
     for b in range(n_blocks):
         lo, hi = P + b * block_len, P + (b + 1) * block_len
         n = (x[:, lo:hi] == MASK_ID).sum(1)
+        sched = (n // spb)[:, None].repeat(1, spb)
+        sched += (torch.arange(spb, device=x.device)[None] < (n % spb)[:, None]).long()
+        for s in range(spb):
+            is_mask = x == MASK_ID
+            logits = model(x)
+            if temperature > 0:
+                g = -torch.log(-torch.log(torch.rand_like(logits).clamp_min(1e-20)))
+                x0 = (logits / temperature + g).argmax(-1)
+            else:
+                x0 = logits.argmax(-1)
+            pred_hist.append(torch.where(is_mask, x0, x)[:, P:].cpu())
+            if remasking == "low_confidence":
+                conf = F.softmax(logits, -1).gather(-1, x0[..., None]).squeeze(-1)
+            else:
+                conf = torch.rand(x0.shape, device=x.device)
+            conf = conf.masked_fill(~is_mask, -float("inf"))
+            conf[:, hi:] = -float("inf")
+            for i in range(B):
+                k = int(sched[i, s])
+                if k == 0:
+                    continue
+                idx = conf[i].topk(k).indices
+                x[i, idx] = x0[i, idx]
+                commit_step[i, (idx - P).cpu()] = step
+            step += 1
+    return x, commit_step, torch.stack(pred_hist, 1)
+
+# instrumenting commitment 
+def stabilization_step(hist, final):
+    B, S, L = hist.shape
+    same = (hist == final[:, None, :]).int()
+    stable_from = torch.flip(torch.cumprod(torch.flip(same, [1]), 1), [1]).bool()
+    first = stable_from.float().argmax(1)
+    return torch.where(stable_from.any(1), first, torch.full_like(first, float(S)))
+
+model.eval()
+data = get_batch(1000, device)
+for remasking in ["low_confidence", "random"]:
+    out, commit, hist = generate(model, data[:, :PROMPT_LEN], remasking=remasking)
+    resp = out[:, PROMPT_LEN:]
+    stable = stabilization_step(hist, resp.cpu())
+    acc = (resp[:, -1] == data[:, -1]).float().mean().item()
+    print(f"{remasking}: answer acc {acc:.3f}")
+    for j, name in enumerate(RESP_LABELS):
+        print(f"  {name:>4}  commit {commit[:, j].float().mean():.2f}"
+              f"  stable {stable[:, j].mean():.2f}")
