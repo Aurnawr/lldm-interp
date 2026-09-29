@@ -68,3 +68,17 @@ for i in range(3000):
     opt.step()
     if i % 250 == 0 
         print(i,loss.item())
+
+# the sampler 
+@torch.no_grad()
+def generate( model, prompt, gen_len= RESP_LEN, steps = RESP_LEN, block_len= None, temperature = 0.0, remasking = "low_confidence"):
+    B, P = prompt.shape
+    block_len = block_len or gen_len
+    n_blocks = gen_len // block_len
+    spb = steps // n_blocks
+    x = torch.cat([prompt, torch.full((B, gen_len), MASK_ID, device=prompt.device)], 1) # prompt plus masked tokens 
+    commit_step = torch.full((B, gen_len), -1, dtype=torch.long)
+    pred_hist, step = [], 0
+    for b in range(n_blocks):
+        lo, hi = P + b * block_len, P + (b + 1) * block_len
+        n = (x[:, lo:hi] == MASK_ID).sum(1)
